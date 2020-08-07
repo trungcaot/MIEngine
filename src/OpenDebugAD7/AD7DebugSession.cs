@@ -263,6 +263,58 @@ namespace OpenDebugAD7
             return tracepoints;
         }
 
+        /// <summary>
+        /// Converts a string expression into a IDebugProperty2 with given frame and evaluation flags.
+        /// </summary>
+        /// <param name="expression">Expression to evaluate</param>
+        /// <param name="frame">Frame to execute the expression on</param>
+        /// <param name="additionalEvalFlags">Additional evalFlags besides the flags normally used for vs watch window.</param>
+        /// <param name="additionalDapEvalFlags">Additional flags besides NONE.</param>
+        /// <param name="property">Property that is evaluated from 'expression'</param>
+        /// <param name="error">Error when evaluating 'expression'</param>
+        /// <returns>An HRESULT signifiyng if it sucessfuly obtainied a property or not from the expression.</returns>
+        private int GetIDebugPropertyFromExpression(string expression, IDebugStackFrame2 frame, enum_EVALFLAGS additionalEvalFlags, DAPEvalFlags additionalDapEvalFlags, out IDebugProperty2 property, out string error)
+        {
+            property = null;
+            error = string.Empty;
+
+            int hr;
+            IDebugExpressionContext2 expressionContext;
+            hr = frame.GetExpressionContext(out expressionContext);
+            if (hr >= 0)
+            {
+                IDebugExpression2 expressionObject;
+                uint errorIndex;
+                hr = expressionContext.ParseText(expression, enum_PARSEFLAGS.PARSE_EXPRESSION, Constants.ParseRadix, out expressionObject, out error, out errorIndex);
+                if (!string.IsNullOrEmpty(error))
+                {
+                    // TODO: Is this how errors should be returned?
+                    DebuggerTelemetry.ReportError(DebuggerTelemetry.TelemetryEvaluateEventName, 4001, "Error parsing expression");
+                    return HRConstants.E_FAIL;
+                }
+
+                // NOTE: This is the same as what vssdebug normally passes for the watch window
+                enum_EVALFLAGS flags = enum_EVALFLAGS.EVAL_RETURNVALUE |
+                    enum_EVALFLAGS.EVAL_NOEVENTS |
+                    (enum_EVALFLAGS)enum_EVALFLAGS110.EVAL110_FORCE_REAL_FUNCEVAL |
+                    additionalEvalFlags;
+
+                DAPEvalFlags dapEvalFlags = DAPEvalFlags.NONE | 
+                    additionalDapEvalFlags;
+
+                if (expressionObject is IDebugExpressionDAP expressionDapObject)
+                {
+                    hr = expressionDapObject.EvaluateSync(flags, dapEvalFlags, Constants.EvaluationTimeout, null, out property);
+                }
+                else
+                {
+                    hr = expressionObject.EvaluateSync(flags, Constants.EvaluationTimeout, null, out property);
+                }
+            }
+
+            return hr;
+        }
+
         #endregion
 
         #region AD7EventHandlers helper methods
@@ -618,7 +670,8 @@ namespace OpenDebugAD7
                 SupportsConditionalBreakpoints = m_engineConfiguration.ConditionalBP,
                 ExceptionBreakpointFilters = m_engineConfiguration.ExceptionSettings.ExceptionBreakpointFilters.Select(item => new ExceptionBreakpointsFilter() { Default = item.@default, Filter = item.filter, Label = item.label }).ToList(),
                 SupportsClipboardContext = m_engineConfiguration.ClipboardContext,
-                SupportsLogPoints = true
+                SupportsLogPoints = true,
+                SupportsReadMemoryRequest = true
             };
 
             responder.SetResponse(initializeResponse);
@@ -1945,50 +1998,27 @@ namespace OpenDebugAD7
                 responder.SetError(new ProtocolException("Cannot evaluate expression on the specified stack frame."));
                 return;
             }
+            enum_EVALFLAGS flags = 0;
+            DAPEvalFlags dapEvalFlags = DAPEvalFlags.NONE;
 
-            IDebugExpressionContext2 expressionContext;
-            hr = frame.GetExpressionContext(out expressionContext);
-            eb.CheckHR(hr);
-
-            IDebugExpression2 expressionObject;
-            string error;
-            uint errorIndex;
-            hr = expressionContext.ParseText(expression, enum_PARSEFLAGS.PARSE_EXPRESSION, Constants.ParseRadix, out expressionObject, out error, out errorIndex);
-            if (!string.IsNullOrEmpty(error))
-            {
-                // TODO: Is this how errors should be returned?
-                DebuggerTelemetry.ReportError(DebuggerTelemetry.TelemetryEvaluateEventName, 4001, "Error parsing expression");
-                responder.SetError(new ProtocolException(error));
-                return;
-            }
-            eb.CheckHR(hr);
-            eb.CheckOutput(expressionObject);
-
-            // NOTE: This is the same as what vssdebug normally passes for the watch window
-            enum_EVALFLAGS flags = enum_EVALFLAGS.EVAL_RETURNVALUE |
-                enum_EVALFLAGS.EVAL_NOEVENTS |
-                (enum_EVALFLAGS)enum_EVALFLAGS110.EVAL110_FORCE_REAL_FUNCEVAL;
-
-            if (context == EvaluateArguments.ContextValue.Hover) // No side effects for data tips
+            if (context == EvaluateArguments.ContextValue.Hover) // No side effects for data tips	
             {
                 flags |= enum_EVALFLAGS.EVAL_NOSIDEEFFECTS;
             }
 
-            IDebugProperty2 property;
-            if (expressionObject is IDebugExpressionDAP expressionDapObject)
+            if (context == EvaluateArguments.ContextValue.Clipboard)
             {
-                DAPEvalFlags dapEvalFlags = DAPEvalFlags.NONE;
-                if (context == EvaluateArguments.ContextValue.Clipboard)
-                {
-                    dapEvalFlags |= DAPEvalFlags.CLIPBOARD_CONTEXT;
-                }
-                hr = expressionDapObject.EvaluateSync(flags, dapEvalFlags, Constants.EvaluationTimeout, null, out property);
-            }
-            else
-            {
-                hr = expressionObject.EvaluateSync(flags, Constants.EvaluationTimeout, null, out property);
+                dapEvalFlags |= DAPEvalFlags.CLIPBOARD_CONTEXT;
             }
 
+            IDebugProperty2 property;
+            string error;
+            hr = GetIDebugPropertyFromExpression(expression, frame, flags, dapEvalFlags, out property, out error);
+            if (!string.IsNullOrEmpty(error))
+            {
+                responder.SetError(new ProtocolException(error));
+                return;
+            }
             eb.CheckHR(hr);
             eb.CheckOutput(property);
 
@@ -2027,6 +2057,65 @@ namespace OpenDebugAD7
                 VariablesReference = variable.VariablesReference
             });
 
+        }
+
+        protected override void HandleReadMemoryRequestAsync(IRequestResponder<ReadMemoryArguments, ReadMemoryResponse> responder)
+        {
+            int hr;
+            ReadMemoryArguments rma = responder.Arguments;
+            ErrorBuilder eb = new ErrorBuilder(() => AD7Resources.Error_Scenario_ReadMemory);
+            try
+            {
+                IDebugStackFrame2 frame;
+                m_frameHandles.TryGetFirst(out frame);
+                eb.CheckOutput(frame);
+
+                IDebugProperty2 property;
+                string error;
+                hr = GetIDebugPropertyFromExpression(rma.MemoryReference, frame, 0, DAPEvalFlags.NONE, out property, out error);
+                if (!string.IsNullOrEmpty(error))
+                {
+                    responder.SetError(new ProtocolException(error));
+                    return;
+                }
+                eb.CheckHR(hr);
+                eb.CheckOutput(property);
+
+                hr = property.GetMemoryContext(out IDebugMemoryContext2 ppMemory);
+                eb.CheckHR(hr);
+
+                if (rma.Offset.HasValue)
+                {
+                    if (rma.Offset > 0)
+                    {
+                        hr = ppMemory.Add((ulong)rma.Offset, out IDebugMemoryContext2 ppMemCxt);
+                    }
+                    else
+                    {
+                        ulong offset = (ulong)-rma.Offset;
+                        hr = ppMemory.Subtract(offset, out IDebugMemoryContext2 ppMemCxt);
+                    }
+                    eb.CheckHR(hr);
+                }
+
+                byte[] data = new byte[rma.Count];
+                uint pdwUnreadable = 0;
+                hr = m_program.GetMemoryBytes(out IDebugMemoryBytes2 debugMemoryBytes);
+                eb.CheckHR(hr);
+                hr = debugMemoryBytes.ReadAt(ppMemory, (uint)rma.Count, data, out uint pdwRead, ref pdwUnreadable);
+                eb.CheckHR(hr);
+
+                responder.SetResponse(new ReadMemoryResponse()
+                {
+                    Address = rma.MemoryReference,
+                    Data = Convert.ToBase64String(data),
+                    UnreadableBytes = (int?)pdwUnreadable
+                });
+            }
+            catch (AD7Exception e)
+            {
+                responder.SetError(new ProtocolException(e.Message));
+            }
         }
 
         #endregion
