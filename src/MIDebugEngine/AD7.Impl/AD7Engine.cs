@@ -15,6 +15,7 @@ using MICore;
 using System.Globalization;
 using Microsoft.DebugEngineHost;
 using Logger = MICore.Logger;
+using Microsoft.VisualStudio.Debugger.Interop.DAP;
 
 namespace Microsoft.MIDebugEngine
 {
@@ -34,7 +35,7 @@ namespace Microsoft.MIDebugEngine
 
     [System.Runtime.InteropServices.ComVisible(true)]
     [System.Runtime.InteropServices.Guid("0fc2f352-2fc1-4f80-8736-51cd1ab28f16")]
-    sealed public class AD7Engine : IDebugEngine2, IDebugEngineLaunch2, IDebugEngine3, IDebugProgram3, IDebugEngineProgram2, IDebugMemoryBytes2, IDebugEngine110, IDisposable
+    sealed public class AD7Engine : IDebugEngine2, IDebugEngineLaunch2, IDebugEngine3, IDebugProgram3, IDebugEngineProgram2, IDebugMemoryBytes2, IDebugEngine110, IDebugMemoryBytesDAP, IDisposable
     {
         // used to send events to the debugger. Some examples of these events are thread create, exception thrown, module load.
         private EngineCallback _engineCallback;
@@ -1133,6 +1134,16 @@ namespace Microsoft.MIDebugEngine
         public int WriteAt(IDebugMemoryContext2 pStartContext, uint dwCount, byte[] rgbMemory)
         {
             throw new NotImplementedException();
+        }
+
+        #endregion
+
+        #region IDebugMemoryBytesDAP
+
+        int IDebugMemoryBytesDAP.CreateMemoryContext(ulong address, out IDebugMemoryContext2 ppResult)
+        {
+            ppResult = new AD7MemoryAddress(this, address, null);
+            return Constants.S_OK;
         }
 
         #endregion
